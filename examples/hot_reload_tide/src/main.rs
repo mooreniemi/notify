@@ -1,3 +1,4 @@
+use arc_swap::ArcSwap;
 use hot_reload_tide::messages::{load_config, Config};
 use notify::{Error, Event, PollWatcher, RecommendedWatcher, RecursiveMode, Watcher};
 use serde::{Deserialize, Serialize};
@@ -9,7 +10,9 @@ use std::sync::{Arc, RwLock};
 use std::time::Duration;
 use tide::{log, Body, Response};
 
-const CONFIG_PATH: &str = "config.json";
+const CONFIG_DIR_PATH: &str = "/tmp/configs/";
+const CONFIG_PATH: &str = "/tmp/configs/config.json";
+
 const SEGMENTS_PATH: &str = "/tmp/segments/";
 const SEGMENTS_VERSION_PATH: &str = "/tmp/segments/version";
 
@@ -26,7 +29,7 @@ pub struct Segment {
 }
 type Segments = HashMap<SegmentName, Segment>;
 
-// for initial loading of everything at boot and coord mode
+/// for initial loading of everything at boot and coord mode
 pub fn load_segments(path: &str) -> Result<Segments, Box<dyn std::error::Error>> {
     let paths = read_dir(path)?;
     let mut segments = HashMap::new();
@@ -53,6 +56,7 @@ pub fn load_segments(path: &str) -> Result<Segments, Box<dyn std::error::Error>>
             } else {
                 let reader = std::io::BufReader::new(file);
                 let segment: Segment = serde_json::from_reader(reader)?;
+                log::info!("LOAD: {:?}", &full_p);
                 segments.insert(full_p, segment);
             }
         }
@@ -60,8 +64,6 @@ pub fn load_segments(path: &str) -> Result<Segments, Box<dyn std::error::Error>>
     Ok(segments)
 }
 
-// Because we're running a web server we need a runtime,
-// for more information on async runtimes, please check out [async-std](https://github.com/async-rs/async-std)
 #[async_std::main]
 async fn main() -> tide::Result<()> {
     log::start();
@@ -73,32 +75,38 @@ async fn main() -> tide::Result<()> {
     };
     log::info!("coordination mode is {}", coord);
 
-    let config = load_config(CONFIG_PATH).unwrap();
-    let segments: HashMap<String, Segment> = load_segments(SEGMENTS_PATH).unwrap();
-
-    let config = Arc::new(RwLock::new(config));
-    let cloned_config = Arc::clone(&config);
-
-    let a_segments = Arc::new(RwLock::new(segments));
-    let c_a_segments = Arc::clone(&a_segments);
+    let initial_config = load_config(CONFIG_PATH).unwrap();
+    let config = Arc::new(ArcSwap::from_pointee(initial_config));
+    let c_config = Arc::clone(&config);
 
     let mut watcher = RecommendedWatcher::new(
         move |result: Result<Event, Error>| {
             let event = result.unwrap();
+            log::info!("config event: {:?}", event);
 
             if event.kind.is_modify() {
                 match load_config(CONFIG_PATH) {
                     Ok(new_config) => {
-                        *cloned_config.write().unwrap() = new_config;
-                        log::info!("updated config");
+                        log::info!("loaded new_config: {:?}", new_config);
+                        c_config.store(Arc::new(new_config));
+                        log::info!("c_config now: {:?}", c_config);
                     }
                     Err(error) => log::info!("Error reloading config: {:?}", error),
                 }
             }
+            log::info!("done");
         },
         notify::Config::default(),
     )?;
-    watcher.watch(Path::new(CONFIG_PATH), RecursiveMode::Recursive)?;
+    // unless we watch the containing dir for config.json,
+    // ArcSwap works once, but then creates a Remove(File) event
+    // which then detaches the watcher (but file is not removed),
+    // meaning only first update works. idk why yet :)
+    watcher.watch(Path::new(CONFIG_DIR_PATH), RecursiveMode::Recursive)?;
+
+    let segments: HashMap<String, Segment> = load_segments(SEGMENTS_PATH).unwrap();
+    let a_segments = Arc::new(RwLock::new(segments));
+    let c_a_segments = Arc::clone(&a_segments);
 
     // for nfs need to poll
     let mut segments_watcher = PollWatcher::new(
@@ -203,7 +211,7 @@ async fn main() -> tide::Result<()> {
     Ok(())
 }
 
-type Request = tide::Request<(Arc<RwLock<Config>>, Arc<RwLock<HashMap<String, Segment>>>)>;
+type Request = tide::Request<(Arc<ArcSwap<Config>>, Arc<RwLock<HashMap<String, Segment>>>)>;
 
 async fn get_segments(req: Request) -> tide::Result {
     let mut res = Response::new(200);
@@ -248,7 +256,7 @@ async fn search(req: Request) -> tide::Result {
 
 async fn get_messages(req: Request) -> tide::Result {
     let mut res = Response::new(200);
-    let config = &req.state().0.read().unwrap();
+    let config = &req.state().0.load();
     let body = Body::from_json(&config.messages)?;
     res.set_body(body);
     Ok(res)
@@ -258,7 +266,7 @@ async fn get_message(req: Request) -> tide::Result {
     let mut res = Response::new(200);
 
     let name: String = req.param("name")?.parse()?;
-    let config = &req.state().0.read().unwrap();
+    let config = &req.state().0.load();
     let value = config.messages.get(&name);
 
     let body = Body::from_json(&value)?;
