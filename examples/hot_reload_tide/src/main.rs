@@ -1,12 +1,13 @@
 use arc_swap::ArcSwap;
 use hot_reload_tide::messages::{load_config, Config};
 use notify::{Error, Event, PollWatcher, RecommendedWatcher, RecursiveMode, Watcher};
+use rcu_clean::ArcRcu;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::HashMap;
 use std::fs::read_dir;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, RwLock};
+use std::sync::Arc;
 use std::time::Duration;
 use tide::{log, Body, Response};
 
@@ -22,7 +23,7 @@ type PostingList = Vec<usize>;
 type InvertedIndex = HashMap<Term, PostingList>;
 
 /// A pretend ii
-#[derive(Deserialize, Serialize)]
+#[derive(Deserialize, Serialize, Clone)]
 pub struct Segment {
     data: InvertedIndex,
     version: String,
@@ -105,8 +106,10 @@ async fn main() -> tide::Result<()> {
     watcher.watch(Path::new(CONFIG_DIR_PATH), RecursiveMode::Recursive)?;
 
     let segments: HashMap<String, Segment> = load_segments(SEGMENTS_PATH).unwrap();
-    let a_segments = Arc::new(RwLock::new(segments));
-    let c_a_segments = Arc::clone(&a_segments);
+    let a_segments = ArcRcu::new(segments);
+    // ArcRcu supposed to be 2-3x faster than Arc<RwLock
+    // let a_segments = Arc::new(RwLock::new(segments));
+    let c_a_segments = a_segments.clone();
 
     // for nfs need to poll
     let mut segments_watcher = PollWatcher::new(
@@ -143,8 +146,7 @@ async fn main() -> tide::Result<()> {
                                         serde_json::from_reader(reader).expect("segment");
                                     log::info!("LOAD: {:?}", &p);
                                     // we don't lock until AFTER we have already loaded the structure
-                                    let mut segments = c_a_segments.write().unwrap();
-                                    segments.insert(
+                                    c_a_segments.update().insert(
                                         p.to_str().expect("valid path").to_string(),
                                         segment,
                                     );
@@ -166,7 +168,7 @@ async fn main() -> tide::Result<()> {
                             let new_segments =
                                 load_segments(SEGMENTS_PATH).expect("valid new segments");
                             // can validate against updated version
-                            *c_a_segments.write().unwrap() = new_segments;
+                            *c_a_segments.update() = new_segments;
                         }
                     } else {
                         log::warn!("MODIFY: {:?} (unused)", event.paths);
@@ -181,8 +183,9 @@ async fn main() -> tide::Result<()> {
                                 continue;
                             } else {
                                 log::info!("UNLOAD: {:?}", &p);
-                                let mut segments = c_a_segments.write().unwrap();
-                                segments.remove(&p.to_str().expect("valid path").to_string());
+                                c_a_segments
+                                    .update()
+                                    .remove(&p.to_str().expect("valid path").to_string());
                             }
                         }
                     }
@@ -211,12 +214,12 @@ async fn main() -> tide::Result<()> {
     Ok(())
 }
 
-type Request = tide::Request<(Arc<ArcSwap<Config>>, Arc<RwLock<HashMap<String, Segment>>>)>;
+type Request = tide::Request<(Arc<ArcSwap<Config>>, ArcRcu<HashMap<String, Segment>>)>;
 
 async fn get_segments(req: Request) -> tide::Result {
     let mut res = Response::new(200);
-    let segments = req.state().1.read().unwrap();
-    let json = serde_json::to_value(&*segments)?;
+    let segments = &req.state().1;
+    let json = serde_json::to_value(&**segments)?;
     let body = Body::from_json(&json)?;
     res.set_body(body);
     Ok(res)
@@ -226,7 +229,7 @@ async fn get_segment(req: Request) -> tide::Result {
     let mut res = Response::new(200);
 
     let name: String = req.param("name")?.parse()?;
-    let segments = &req.state().1.read().unwrap();
+    let segments = &req.state().1;
     let value = segments.get(&name);
 
     let body = Body::from_json(&value)?;
@@ -239,7 +242,7 @@ async fn search(req: Request) -> tide::Result {
 
     let term: String = req.param("term")?.parse()?;
     log::info!("searching for {}", term);
-    let segments = &req.state().1.read().unwrap();
+    let segments = &req.state().1;
     let mut results: Vec<usize> = Vec::new();
     for (_segment_path, segment) in segments.iter() {
         if let Some(doc_ids) = segment.data.get(&term) {
