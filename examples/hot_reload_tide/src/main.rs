@@ -1,13 +1,12 @@
 use arc_swap::ArcSwap;
 use hot_reload_tide::messages::{load_config, Config};
 use notify::{Error, Event, PollWatcher, RecommendedWatcher, RecursiveMode, Watcher};
-use rcu_clean::ArcRcu;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::HashMap;
 use std::fs::read_dir;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 use std::time::Duration;
 use tide::{log, Body, Response};
 
@@ -77,6 +76,7 @@ async fn main() -> tide::Result<()> {
     log::info!("coordination mode is {}", coord);
 
     let initial_config = load_config(CONFIG_PATH).unwrap();
+    // we can use ArcSwap here because we're reloading the entire config at once
     let config = Arc::new(ArcSwap::from_pointee(initial_config));
     let c_config = Arc::clone(&config);
 
@@ -106,10 +106,19 @@ async fn main() -> tide::Result<()> {
     watcher.watch(Path::new(CONFIG_DIR_PATH), RecursiveMode::Recursive)?;
 
     let segments: HashMap<String, Segment> = load_segments(SEGMENTS_PATH).unwrap();
-    let a_segments = ArcRcu::new(segments);
-    // ArcRcu supposed to be 2-3x faster than Arc<RwLock
+    // there's a few different options for how to handle the segments map
+    // we want fast reads, rare updates, and to not trade too much memory
+    // first choice is Arc<RwLock but it's actually pretty slow reads
     // let a_segments = Arc::new(RwLock::new(segments));
-    let c_a_segments = a_segments.clone();
+    // so next choice might be ArcRcu, supposed to be 2-3x faster than Arc<RwLock
+    // let a_segments = ArcRcu::new(segments);
+    // but it means all segments are copied when updated which defeats the point
+    // of segments given we want incremental loading to keep memory consumption low
+    // this is also true of ArcSwap, because it only has a full store/swap method
+    // let a_segments = Arc::new(ArcSwap::from_pointee(segments));
+    // so ultimately we go with our first choice, to favor lower memory consumption
+    let a_segments = Arc::new(RwLock::new(segments));
+    let c_a_segments = Arc::clone(&a_segments);
 
     // for nfs need to poll
     let mut segments_watcher = PollWatcher::new(
@@ -146,7 +155,7 @@ async fn main() -> tide::Result<()> {
                                         serde_json::from_reader(reader).expect("segment");
                                     log::info!("LOAD: {:?}", &p);
                                     // we don't lock until AFTER we have already loaded the structure
-                                    c_a_segments.update().insert(
+                                    c_a_segments.write().unwrap().insert(
                                         p.to_str().expect("valid path").to_string(),
                                         segment,
                                     );
@@ -163,12 +172,13 @@ async fn main() -> tide::Result<()> {
                         let reader = std::io::BufReader::new(file);
                         let v: Value = serde_json::from_reader(reader).expect("version");
                         log::info!("version: {:?}", v["version"]);
+                        // in coordinated mode we could use ArcSwap instead
                         if coord {
                             log::info!("coord mode on, reloading all segments at once");
                             let new_segments =
                                 load_segments(SEGMENTS_PATH).expect("valid new segments");
                             // can validate against updated version
-                            *c_a_segments.update() = new_segments;
+                            *c_a_segments.write().unwrap() = new_segments;
                         }
                     } else {
                         log::warn!("MODIFY: {:?} (unused)", event.paths);
@@ -184,7 +194,8 @@ async fn main() -> tide::Result<()> {
                             } else {
                                 log::info!("UNLOAD: {:?}", &p);
                                 c_a_segments
-                                    .update()
+                                    .write()
+                                    .unwrap()
                                     .remove(&p.to_str().expect("valid path").to_string());
                             }
                         }
@@ -214,7 +225,7 @@ async fn main() -> tide::Result<()> {
     Ok(())
 }
 
-type Request = tide::Request<(Arc<ArcSwap<Config>>, ArcRcu<HashMap<String, Segment>>)>;
+type Request = tide::Request<(Arc<ArcSwap<Config>>, Arc<RwLock<HashMap<String, Segment>>>)>;
 
 async fn get_segments(req: Request) -> tide::Result {
     let mut res = Response::new(200);
@@ -229,7 +240,7 @@ async fn get_segment(req: Request) -> tide::Result {
     let mut res = Response::new(200);
 
     let name: String = req.param("name")?.parse()?;
-    let segments = &req.state().1;
+    let segments = &req.state().1.read().unwrap();
     let value = segments.get(&name);
 
     let body = Body::from_json(&value)?;
@@ -242,7 +253,7 @@ async fn search(req: Request) -> tide::Result {
 
     let term: String = req.param("term")?.parse()?;
     log::info!("searching for {}", term);
-    let segments = &req.state().1;
+    let segments = &req.state().1.read().unwrap();
     let mut results: Vec<usize> = Vec::new();
     for (_segment_path, segment) in segments.iter() {
         if let Some(doc_ids) = segment.data.get(&term) {
