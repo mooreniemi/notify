@@ -8,6 +8,12 @@ edition = "2021"
 notify = { version = "5.0.0" }
 notify-debouncer-mini = { version = "0.2.0" }
 futures = "0.3"
+concurrent-list = "0.0.2"
+lockfree-cuckoohash = "0.1"
+
+[[example]]
+name = "cl"
+path = "cl.rs"
 
 [[example]]
 name = "async_monitor"
